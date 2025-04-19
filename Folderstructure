@@ -1,0 +1,43 @@
+.
+├── backend.tf
+├── providers.tf
+├── locals.tf
+├── variables.tf
+├── outputs.tf
+├── main.tf
+├── terraform.tfvars
+├── security-group.auto.tfvars
+├── README.md
+└── modules
+    ├── ec2
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── efs
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── loadbalancer
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── rds
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── ssm
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── backup
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── sg
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    └── tga
+        ├── main.tf
+        ├── variables.tf
+        └── outputs.tf
