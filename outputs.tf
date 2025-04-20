@@ -1,5 +1,3 @@
-# /Users/tirumal/Downloads/chatgpt/mycodetf-main/outputs.tf
-
 output "private_instance_ids" {
   description = "Map of logical names to instance IDs for private utility servers (e.g., mysql, postgresql)."
   value       = module.private_ec2.instance_ids
