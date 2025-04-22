@@ -1,3 +1,5 @@
+
+
 variable "aws_region" {
   type        = string
   description = "AWS region to deploy resources (e.g., 'us-east-1')."
@@ -81,6 +83,8 @@ variable "public_servers" {
   default     = {}
 }
 
+# /Users/tirumal/Downloads/chatgpt/mycodetf-main/variables.tf
+
 variable "application_servers" {
   type = map(object({
     # --- Instance Definitions ---
@@ -98,7 +102,8 @@ variable "application_servers" {
       type            = string       # "application" or "network"
       scheme          = string       # "internal" or "internet-facing"
       listener_port   = number       # Port for the listener
-      security_groups = list(string) # List of logical SG *keys* (only used for type="application")
+      # --- CORRECTED: Made security_groups optional ---
+      security_groups = optional(list(string), []) # List of logical SG *keys* (only used for type="application")
       # --- Optional Health Check ---
       health_check = optional(object({
         path                = optional(string, "/") # HC Path for ALBs
