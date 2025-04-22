@@ -1,3 +1,7 @@
+
+# REMOVED: The large locals { ... } block previously here.
+# This file now relies on the separate locals.tf file.
+
 # --- Security Groups ---
 module "sg" {
   source = "./sg" # Verify path
@@ -189,18 +193,39 @@ module "efs" {
 # Dynamic values (IPs, DNS) are NOT injected here.
 # Consider using data sources within application configuration/userdata to read SSM,
 # or enhance the SSM module/locals if dynamic injection is strictly needed via Terraform.
+# --- SSM Parameters ---
 module "ssm" {
   source = "./ssm" # Verify path
 
-  # Pass the definitions directly from variables.tfvars
-  # Assumes ssm module input is 'ssm_parameters' and can handle the structure
-  # defined in the root variables.tf (without pre-resolved 'name' or 'value')
-  ssm_parameters = var.ssm_parameters
+  # CORRECTED: Pass the processed map from locals.tf
+  # This map contains the generated 'name' and the string-formatted 'value'
+  # Assumes the SSM module's input variable is named 'ssm_parameters'
+  ssm_parameters = {
+     for k, p in local.ssm_parameters_processed : k => {
+        # Map attributes from the processed local to the module's expected input object
+        name        = p.name
+        description = p.description
+        value       = p.value_string # Use the correctly formatted string value
+        type        = p.type
+        key_id      = p.key_id
+     }
+  }
 
   common_tags = var.common_tags # Pass common tags
 
-  # No explicit depends_on needed unless module needs specific resource ARNs not passed in vars
+  # Add depends_on because local.ssm_parameters_processed uses local.dynamic_infra_values,
+  # which in turn depends on other modules.
+  depends_on = [
+    module.private_ec2,
+    module.rds,
+    module.crm_lb,
+    module.clover_lb,
+    module.ldaphaproxy_lb,
+    module.crm_ec2 # Added missing dependency from dynamic_infra_values
+    # Add other modules if their outputs are used in dynamic_infra_values
+  ]
 }
+
 
 # --- Backup ---
 module "backup" {
