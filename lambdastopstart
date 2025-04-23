@@ -1,0 +1,301 @@
+# lambda/scheduler_notify.py
+import os
+import boto3
+import logging
+import json
+from datetime import datetime
+import time # Import time for potential delays
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Environment variables
+REGION = os.environ.get('REGION', 'us-east-1')
+TAG_KEY = os.environ.get('TAG_KEY', 'AutoStartStop')
+TAG_VALUE = os.environ.get('TAG_VALUE', 'true')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+# Initialize AWS clients
+ec2 = boto3.client('ec2', region_name=REGION)
+rds = boto3.client('rds', region_name=REGION)
+sns = boto3.client('sns', region_name=REGION)
+
+def find_ec2_instances(tag_key, tag_value, states):
+    """Finds EC2 instances based on tag and state."""
+    instance_ids = []
+    instance_details = {}
+    try:
+        paginator = ec2.get_paginator('describe_instances')
+        page_iterator = paginator.paginate(
+            Filters=[
+                {'Name': f'tag:{tag_key}', 'Values': [tag_value]},
+                {'Name': 'instance-state-name', 'Values': states}
+            ]
+        )
+        for page in page_iterator:
+            for reservation in page['Reservations']:
+                for instance in reservation['Instances']:
+                    instance_id = instance['InstanceId']
+                    instance_ids.append(instance_id)
+                    name_tag = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+                    instance_details[instance_id] = {'Name': name_tag, 'State': instance['State']['Name']}
+        logger.info(f"Found EC2 instances {list(instance_details.keys())} in states {states} with tag {tag_key}={tag_value}")
+    except Exception as e:
+        logger.error(f"Error describing EC2 instances: {e}")
+        # Return empty lists/dicts on error, error will be reported later
+    return instance_ids, instance_details
+
+def find_rds_instances(tag_key, tag_value, states):
+    """Finds RDS instances based on tag and state using ListTagsForResource."""
+    instance_ids = []
+    instance_details = {}
+    try:
+        paginator = rds.get_paginator('describe_db_instances')
+        page_iterator = paginator.paginate() # Get all initially, then filter
+
+        for page in page_iterator:
+            for db_instance in page['DBInstances']:
+                instance_arn = db_instance['DBInstanceArn']
+                instance_id = db_instance['DBInstanceIdentifier']
+                instance_state = db_instance['DBInstanceStatus']
+
+                # Check state first
+                if instance_state not in states:
+                    continue
+
+                # Check tags using ListTagsForResource (more reliable for RDS)
+                try:
+                    tags_response = rds.list_tags_for_resource(ResourceName=instance_arn)
+                    instance_tags = {tag['Key']: tag['Value'] for tag in tags_response.get('TagList', [])}
+
+                    if instance_tags.get(tag_key) == tag_value:
+                        instance_ids.append(instance_id)
+                        instance_details[instance_id] = {'Name': instance_id, 'State': instance_state}
+                except Exception as tag_error:
+                     logger.warning(f"Could not list/check tags for RDS instance {instance_id} (ARN: {instance_arn}): {tag_error}")
+                     # Decide if you want to proceed without tag confirmation or skip
+
+        logger.info(f"Found RDS instances {list(instance_details.keys())} in states {states} with tag {tag_key}={tag_value}")
+
+    except Exception as e:
+        logger.error(f"Error describing RDS instances: {e}")
+        # Return empty lists/dicts on error
+    return instance_ids, instance_details
+
+
+def get_all_target_statuses(tag_key, tag_value):
+    """Gets the current status of all EC2 and RDS instances with the target tag."""
+    ec2_statuses = {}
+    rds_statuses = {}
+    logger.info(f"Getting current status for all resources tagged {tag_key}={tag_value}")
+
+    # Get EC2 Statuses
+    try:
+        paginator_ec2 = ec2.get_paginator('describe_instances')
+        page_iterator_ec2 = paginator_ec2.paginate(
+            Filters=[{'Name': f'tag:{tag_key}', 'Values': [tag_value]}]
+        )
+        for page in page_iterator_ec2:
+            for reservation in page['Reservations']:
+                for instance in reservation['Instances']:
+                    # Filter out terminated instances from the status report
+                    if instance['State']['Name'] == 'terminated':
+                        continue
+                    instance_id = instance['InstanceId']
+                    name_tag = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), instance_id)
+                    ec2_statuses[instance_id] = {'Name': name_tag, 'State': instance['State']['Name']}
+    except Exception as e:
+        logger.error(f"Error getting EC2 statuses: {e}")
+        ec2_statuses["ERROR"] = {'Name': 'EC2 Status Check Failed', 'State': str(e)}
+
+    # Get RDS Statuses
+    try:
+        paginator_rds = rds.get_paginator('describe_db_instances')
+        page_iterator_rds = paginator_rds.paginate()
+        for page in page_iterator_rds:
+             for db_instance in page['DBInstances']:
+                instance_arn = db_instance['DBInstanceArn']
+                instance_id = db_instance['DBInstanceIdentifier']
+                try:
+                    tags_response = rds.list_tags_for_resource(ResourceName=instance_arn)
+                    instance_tags = {tag['Key']: tag['Value'] for tag in tags_response.get('TagList', [])}
+                    if instance_tags.get(tag_key) == tag_value:
+                         rds_statuses[instance_id] = {'Name': instance_id, 'State': db_instance['DBInstanceStatus']}
+                except Exception as tag_error:
+                    logger.warning(f"Could not list/check tags for RDS instance {instance_id} during status check: {tag_error}")
+
+    except Exception as e:
+        logger.error(f"Error getting RDS statuses: {e}")
+        rds_statuses["ERROR"] = {'Name': 'RDS Status Check Failed', 'State': str(e)}
+
+    return ec2_statuses, rds_statuses
+
+def format_status_message(action, ec2_statuses, rds_statuses, errors):
+    """Formats the status message for SNS."""
+    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    subject = f"Resource Scheduler Notification: {action} Action Completed ({REGION})"
+
+    body = f"Automated Resource Scheduler\n"
+    body += f"Action: {action}\n"
+    body += f"Timestamp: {timestamp}\n"
+    body += f"Region: {REGION}\n"
+    body += f"Tag: {TAG_KEY}={TAG_VALUE}\n\n"
+
+    body += "--- EC2 Instance Status ---\n"
+    if ec2_statuses:
+        if "ERROR" in ec2_statuses:
+             body += f"ERROR checking EC2 status: {ec2_statuses['ERROR']['State']}\n"
+        else:
+            for inst_id, details in sorted(ec2_statuses.items()):
+                body += f"- ID: {inst_id}, Name: {details['Name']}, State: {details['State']}\n"
+    else:
+        body += "No EC2 instances found with the specified tag.\n"
+
+    body += "\n--- RDS Instance Status ---\n"
+    if rds_statuses:
+        if "ERROR" in rds_statuses:
+             body += f"ERROR checking RDS status: {rds_statuses['ERROR']['State']}\n"
+        else:
+            for inst_id, details in sorted(rds_statuses.items()):
+                body += f"- ID: {inst_id}, State: {details['State']}\n"
+    else:
+        body += "No RDS instances found with the specified tag.\n"
+
+    if errors:
+        body += "\n--- Errors Encountered During Action ---\n"
+        for error in errors:
+            body += f"- {error}\n"
+
+    return subject, body
+
+def lambda_handler(event, context):
+    """Lambda handler function."""
+    action = event.get('action')
+    errors = [] # Store errors encountered during start/stop actions
+
+    # Validate SNS Topic ARN early
+    if not SNS_TOPIC_ARN:
+        logger.critical("CRITICAL: SNS_TOPIC_ARN environment variable not set. Cannot send notifications.")
+        # Depending on requirements, you might still want to proceed with actions,
+        # but for safety, we'll stop if we can't notify.
+        return {'statusCode': 500, 'body': 'Configuration error: SNS_TOPIC_ARN missing.'}
+
+    # Validate Action
+    if action not in ['START', 'STOP']:
+        err_msg = f"Invalid action specified: {action}. Must be 'START' or 'STOP'."
+        logger.error(err_msg)
+        errors.append(err_msg)
+        # Attempt to send error notification even with invalid action
+        subject = f"Resource Scheduler Error ({REGION})"
+        try:
+            sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=err_msg)
+        except Exception as sns_error:
+             logger.error(f"Failed to send initial error notification: {sns_error}")
+        return {'statusCode': 400, 'body': err_msg}
+
+    logger.info(f"Received request to {action} instances in region {REGION} with tag {TAG_KEY}={TAG_VALUE}")
+
+    # --- Perform Actions ---
+    if action == 'STOP':
+        # Stop EC2
+        ec2_to_stop_ids, _ = find_ec2_instances(TAG_KEY, TAG_VALUE, ['pending', 'running'])
+        if ec2_to_stop_ids:
+            try:
+                logger.info(f"Attempting to stop EC2 instances: {ec2_to_stop_ids}")
+                ec2.stop_instances(InstanceIds=ec2_to_stop_ids)
+                logger.info(f"Successfully initiated stop for EC2 instances: {ec2_to_stop_ids}")
+            except Exception as e:
+                err_msg = f"Error stopping EC2 instances {ec2_to_stop_ids}: {e}"
+                logger.error(err_msg)
+                errors.append(f"EC2 Stop Action: {err_msg}")
+        else:
+             logger.info("No running/pending EC2 instances found with the tag to stop.")
+
+        # Stop RDS
+        rds_to_stop_ids, _ = find_rds_instances(TAG_KEY, TAG_VALUE, ['available', 'starting', 'stopping', 'backing-up', 'modifying']) # Include relevant states
+        if rds_to_stop_ids:
+            logger.info(f"Attempting to stop RDS instances: {rds_to_stop_ids}")
+            for rds_id in rds_to_stop_ids:
+                try:
+                    logger.info(f"Stopping RDS instance: {rds_id}")
+                    rds.stop_db_instance(DBInstanceIdentifier=rds_id)
+                    logger.info(f"Successfully initiated stop for RDS instance: {rds_id}")
+                except rds.exceptions.InvalidDBInstanceStateFault as e:
+                     logger.warning(f"RDS instance {rds_id} is likely already stopped or in a state that cannot be stopped: {e}")
+                except Exception as e:
+                    err_msg = f"Error stopping RDS instance {rds_id}: {e}"
+                    logger.error(err_msg)
+                    errors.append(f"RDS Stop Action ({rds_id}): {err_msg}")
+        else:
+            logger.info("No available/transient RDS instances found with the tag to stop.")
+
+
+    elif action == 'START':
+        # Start EC2
+        ec2_to_start_ids, _ = find_ec2_instances(TAG_KEY, TAG_VALUE, ['stopped'])
+        if ec2_to_start_ids:
+            try:
+                logger.info(f"Attempting to start EC2 instances: {ec2_to_start_ids}")
+                ec2.start_instances(InstanceIds=ec2_to_start_ids)
+                logger.info(f"Successfully initiated start for EC2 instances: {ec2_to_start_ids}")
+            except Exception as e:
+                err_msg = f"Error starting EC2 instances {ec2_to_start_ids}: {e}"
+                logger.error(err_msg)
+                errors.append(f"EC2 Start Action: {err_msg}")
+        else:
+            logger.info("No stopped EC2 instances found with the tag to start.")
+
+        # Start RDS
+        rds_to_start_ids, _ = find_rds_instances(TAG_KEY, TAG_VALUE, ['stopped'])
+        if rds_to_start_ids:
+            logger.info(f"Attempting to start RDS instances: {rds_to_start_ids}")
+            for rds_id in rds_to_start_ids:
+                try:
+                    logger.info(f"Starting RDS instance: {rds_id}")
+                    rds.start_db_instance(DBInstanceIdentifier=rds_id)
+                    logger.info(f"Successfully initiated start for RDS instance: {rds_id}")
+                except rds.exceptions.InvalidDBInstanceStateFault as e:
+                     logger.warning(f"RDS instance {rds_id} is likely already started or in a state that cannot be started: {e}")
+                except Exception as e:
+                    err_msg = f"Error starting RDS instance {rds_id}: {e}"
+                    logger.error(err_msg)
+                    errors.append(f"RDS Start Action ({rds_id}): {err_msg}")
+        else:
+            logger.info("No stopped RDS instances found with the tag to start.")
+
+
+    # --- Get Final Statuses and Notify ---
+    # Best Practice: Add a small delay to allow AWS state changes to propagate slightly before status check.
+    logger.info("Waiting briefly before final status check...")
+    time.sleep(20) # 20 seconds delay
+
+    final_ec2_statuses, final_rds_statuses = get_all_target_statuses(TAG_KEY, TAG_VALUE)
+    subject, body = format_status_message(action, final_ec2_statuses, final_rds_statuses, errors)
+
+    try:
+        logger.info(f"Publishing final notification to SNS topic: {SNS_TOPIC_ARN}")
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=body
+        )
+        logger.info("SNS notification published successfully.")
+    except Exception as e:
+        logger.error(f"CRITICAL: Error publishing final status to SNS topic {SNS_TOPIC_ARN}: {e}")
+        # Log error, but the primary action might have succeeded. The function should still indicate success if actions were okay.
+        errors.append(f"SNS Publish Failed: {e}") # Add SNS error to report if possible next time?
+
+    # Return success (200) if the process ran, even if some non-critical errors occurred during actions.
+    # Return failure (500) only for critical configuration issues or maybe widespread action failures.
+    final_status_code = 200 if not any("CRITICAL" in e for e in errors) else 500
+
+    return {
+        'statusCode': final_status_code,
+        'body': json.dumps({
+            'message': f'{action} process completed.',
+            'action_errors': errors, # Include errors encountered during start/stop
+            'final_ec2_status': final_ec2_statuses,
+            'final_rds_status': final_rds_statuses
+        })
+    }
