@@ -236,3 +236,120 @@ module "backup" {
   common_tags   = var.common_tags
   # Assumes backup module uses tag-based selection internally
 }
+
+
+# --- Scheduler Infrastructure ---
+# (SNS Topic, Subscription, IAM Module, Lambda Function, EventBridge Rules/Targets, Log Group)
+# Use the code blocks provided in the previous correct "full implementation" answer for these resources.
+# They rely on local.resource_prefix, local.lambda_function_name, var.schedule_*, var.notification_email etc.
+# --- Data Sources ---
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
+# --- SNS Notification Setup ---
+resource "aws_sns_topic" "scheduler_notifications" {
+  name = "${local.resource_prefix}-scheduler-notifications"
+  tags = merge(var.common_tags, { Name = "${local.resource_prefix}-scheduler-notifications" })
+}
+
+resource "aws_sns_topic_subscription" "email_subscription" {
+  count = var.notification_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.scheduler_notifications.arn
+  protocol  = "email"
+  endpoint  = var.notification_email
+}
+
+# --- IAM Module Instance ---
+module "scheduler_iam" {
+  source = "./modules/iam_scheduler" # Corrected path
+  role_name_prefix     = local.resource_prefix
+  sns_topic_arn        = aws_sns_topic.scheduler_notifications.arn
+  lambda_function_name = local.lambda_function_name
+  tags                 = var.common_tags
+}
+
+# --- Lambda Function ---
+data "archive_file" "lambda_scheduler_notify_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda/"
+  output_path = "${path.module}/lambda_scheduler_notify.zip"
+}
+
+resource "aws_lambda_function" "scheduler_notify" {
+  filename         = data.archive_file.lambda_scheduler_notify_zip.output_path
+  function_name    = local.lambda_function_name
+  role             = module.scheduler_iam.lambda_role_arn
+  handler          = "scheduler_notify.lambda_handler"
+  source_code_hash = data.archive_file.lambda_scheduler_notify_zip.output_base64sha256
+  runtime          = "python3.9"
+  timeout          = var.lambda_timeout_seconds
+  environment {
+    variables = {
+      REGION        = data.aws_region.current.name
+      TAG_KEY       = var.schedule_tag_key
+      TAG_VALUE     = var.schedule_tag_value
+      SNS_TOPIC_ARN = aws_sns_topic.scheduler_notifications.arn
+    }
+  }
+  tags = merge(var.common_tags, { Name = local.lambda_function_name })
+  depends_on = [
+    module.scheduler_iam,
+    aws_cloudwatch_log_group.lambda_scheduler_notify_lg
+  ]
+}
+
+# --- EventBridge Rules & Targets ---
+resource "aws_cloudwatch_event_rule" "stop_resources" {
+  name                = "${local.resource_prefix}-stop-resources-rule"
+  description         = "Stops tagged EC2/RDS resources via Lambda"
+  schedule_expression = var.schedule_stop_cron
+  tags                = merge(var.common_tags, { Name = "${local.resource_prefix}-stop-resources-rule" })
+  timezone            = var.schedule_timezone != "" ? var.schedule_timezone : null
+}
+
+resource "aws_cloudwatch_event_rule" "start_resources" {
+  name                = "${local.resource_prefix}-start-resources-rule"
+  description         = "Starts tagged EC2/RDS resources via Lambda"
+  schedule_expression = var.schedule_start_cron
+  tags                = merge(var.common_tags, { Name = "${local.resource_prefix}-start-resources-rule" })
+  timezone            = var.schedule_timezone != "" ? var.schedule_timezone : null
+}
+
+resource "aws_lambda_permission" "allow_stop_event" {
+  statement_id  = "AllowExecutionFromCloudWatchStopRule"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler_notify.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.stop_resources.arn
+}
+
+resource "aws_lambda_permission" "allow_start_event" {
+  statement_id  = "AllowExecutionFromCloudWatchStartRule"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler_notify.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.start_resources.arn
+}
+
+resource "aws_cloudwatch_event_target" "stop_target" {
+  rule      = aws_cloudwatch_event_rule.stop_resources.name
+  target_id = "${local.resource_prefix}-stop-lambda-target"
+  arn       = aws_lambda_function.scheduler_notify.arn
+  input     = jsonencode({"action" : "STOP"})
+  depends_on = [aws_lambda_permission.allow_stop_event]
+}
+
+resource "aws_cloudwatch_event_target" "start_target" {
+  rule      = aws_cloudwatch_event_rule.start_resources.name
+  target_id = "${local.resource_prefix}-start-lambda-target"
+  arn       = aws_lambda_function.scheduler_notify.arn
+  input     = jsonencode({"action" : "START"})
+  depends_on = [aws_lambda_permission.allow_start_event]
+}
+
+# --- CloudWatch Log Group for Lambda ---
+resource "aws_cloudwatch_log_group" "lambda_scheduler_notify_lg" {
+  name              = "/aws/lambda/${local.lambda_function_name}"
+  retention_in_days = var.log_retention_days
+  tags              = merge(var.common_tags, { Name = "${local.lambda_function_name}-log-group" })
+}
