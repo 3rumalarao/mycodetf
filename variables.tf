@@ -252,54 +252,52 @@ variable "existing_common_ec2_profile_name" {
   description = "The name of the existing IAM Role to attach to EC2 instances."
 }
 
+#====================================
+
+# --- Scheduler Variables ---
 variable "schedule_tag_key" {
-  description = "Tag key used to identify resources for scheduled start/stop."
+  description = "Tag key used by the scheduler."
   type        = string
   default     = "AutoStartStop"
 }
 
 variable "schedule_tag_value" {
-  description = "Tag value used to identify resources for scheduled start/stop."
+  description = "Tag value used by the scheduler."
   type        = string
   default     = "true"
 }
 
 variable "schedule_start_cron" {
-  description = "Cron expression for starting resources (UTC recommended unless using timezone)."
+  description = "Cron expression for starting resources (UTC recommended)."
   type        = string
-  # Example: 7 AM America/Chicago (12:00 UTC during standard time, 11:00 UTC during daylight time)
-  # Use UTC for simplicity: 'cron(12 0 * * ? *)' for 12:00 UTC
-  default     = "cron(12 0 * * ? *)" # 12:00 UTC (adjust as needed)
+  default     = "cron(12 0 * * ? *)" # 12:00 UTC
 }
 
 variable "schedule_stop_cron" {
-  description = "Cron expression for stopping resources (UTC recommended unless using timezone)."
+  description = "Cron expression for stopping resources (UTC recommended)."
   type        = string
-  # Example: 5 PM America/Chicago (22:00 UTC during standard time, 21:00 UTC during daylight time)
-  # Use UTC for simplicity: 'cron(22 0 * * ? *)' for 22:00 UTC
-  default     = "cron(22 0 * * ? *)" # 22:00 UTC (adjust as needed)
+  default     = "cron(22 0 * * ? *)" # 22:00 UTC
 }
 
 variable "schedule_timezone" {
-  description = "Optional: IANA timezone name for the cron schedule (e.g., America/Chicago). If omitted or empty, UTC is assumed by EventBridge."
+  description = "Optional: IANA timezone name for the cron schedule (e.g., America/Chicago)."
   type        = string
-  default     = "" # Default to UTC for simplicity unless timezone handling is critical
+  default     = "" # Default to UTC
 }
 
 variable "notification_email" {
-  description = "Email address to send start/stop notifications."
+  description = "Email address for scheduler notifications. MUST BE PROVIDED."
   type        = string
-  # No default - This MUST be provided by the user
 }
 
 variable "lambda_timeout_seconds" {
-  description = "Timeout for the Lambda function in seconds."
+  description = "Timeout for the scheduler Lambda function."
   type        = number
-  default     = 300 # Increased default (5 mins) for RDS operations and status checks
+  default     = 300
 }
 
 variable "log_retention_days" {
-  description = "Number of days to retain Lambda logs in CloudWatch."
+  description = "Retention days for scheduler Lambda logs."
   type        = number
   default     = 14
 }
